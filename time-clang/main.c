@@ -1,5 +1,8 @@
 #include <asm-generic/socket.h>
+#include <bits/types/struct_iovec.h>
+#include <liburing/io_uring.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,9 +11,37 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <time.h>
+#include <liburing.h>
 
 #define PORT 12345
+#define QUEUE_SIZE 1
 #define BUFFER_SIZE 1024
+
+#define STM_READ_REQUEST 1
+#define STM_WRITE_RESPONSE 2
+#define STM_CLOSE_CONNECTION 3
+
+struct io_uring ring;
+
+void io_uring_add_accept_request(int server_fd) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_accept(sqe, server_fd, (struct sockaddr *)NULL, NULL, 0);
+    
+    if (io_uring_submit(&ring) < 0) {
+        perror("io_uring_submit failed");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void io_uring_add_read_request(int fd, const struct iovec *io) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_readv(sqe, fd, io, 1, 0);
+
+    if (io_uring_submit(&ring) < 0) {
+        perror("io_uring_submit failed");
+        exit(EXIT_FAILURE);
+    }
+}
 
 struct stm_t {
     int step;
@@ -18,40 +49,45 @@ struct stm_t {
     char buf[BUFFER_SIZE];
 };
 
-void stm_init(struct stm_t* stm, int conn_fd) {
-    stm->conn_fd = conn_fd;
-    stm->step = 1;
+void stm_reset(struct stm_t *stm) {
+    bzero(stm, sizeof(struct stm_t));
 }
 
-void stm_process(struct stm_t* stm) {
+void stm_bind_connection(struct stm_t *stm, int conn_fd) {
+    printf("bind connection\n");
+    stm->conn_fd = conn_fd;
+    stm->step = STM_READ_REQUEST;
+}
+
+void stm_process(struct stm_t *stm) {
     time_t now;
     int n;
     switch (stm->step) {
-        case 1:
-            // read request
+        case STM_READ_REQUEST:
+            printf("read request\n");
             if (read(stm->conn_fd, stm->buf, sizeof(stm->buf)) < 0) {
                 perror("read failed");
                 exit(EXIT_FAILURE);
             }
-            stm->step = 2;
+            stm->step = STM_WRITE_RESPONSE;
             break;
-        case 2:
-            // write response
+        case STM_WRITE_RESPONSE:
+            printf("write response\n");
             now = time(NULL);
             n = snprintf(stm->buf, sizeof(stm->buf), "HTTP/1.1 200 OK\r\n\r\n%.24s\r\n", ctime(&now));
             if (write(stm->conn_fd, stm->buf, n) < 0) {
                 perror("write failed");
                 exit(EXIT_FAILURE);
             }
-            stm->step = 3;
+            stm->step = STM_CLOSE_CONNECTION;
             break;
-        case 3:
-            // close connection
+        case STM_CLOSE_CONNECTION:
+            printf("close connection\n");
             if (close(stm->conn_fd) < 0) {
                 perror("close failed");
                 exit(EXIT_FAILURE);        
             }
-            bzero(stm, sizeof(struct stm_t));
+            stm_reset(stm);
             break;
         default: 
             printf("invalid state %d", stm->step);
@@ -90,26 +126,51 @@ int start_server(void) {
     return server_fd;
 }
 
-int main(void) {
-    int server_fd = start_server();
+void server_loop(int server_fd, struct stm_t *stm) {
+    io_uring_add_accept_request(server_fd);
 
-    struct stm_t stm;
+    struct io_uring_cqe *cqe;
     while (true) {
-        int conn_fd = accept(server_fd, (struct sockaddr *)NULL, NULL);
-        if (conn_fd < 0) {
-            perror("accept failed");
+        if (io_uring_wait_cqe(&ring, &cqe) < 0) {
+            perror("io_uring_wait_cqe failed");
             exit(EXIT_FAILURE);
         }
+        
+        if (cqe->user_data) {
+            // existing connection
+        } else {
+            // new connection
+            printf("new connection\n");
+            stm_bind_connection(stm, cqe->res);
+            stm_process(stm); // read request
+            stm_process(stm); // write response
+            stm_process(stm); // close connection
+            io_uring_add_accept_request(server_fd);
+        }
 
-        stm_init(&stm, conn_fd);
-
-        // read request
-        stm_process(&stm);
-
-        // write response
-        stm_process(&stm);
-
-         // close connection
-         stm_process(&stm);
+        io_uring_cqe_seen(&ring, cqe);
     }
+}
+
+void sigint_handler(int signo) {
+    printf("server stopped\n");
+    io_uring_queue_exit(&ring);
+    exit(EXIT_SUCCESS);
+}
+
+int main(void) {
+    signal(SIGINT, sigint_handler);
+    
+    if (io_uring_queue_init(QUEUE_SIZE, &ring, 0) < 0) {
+        perror("io_uring_queue_init failed");
+        exit(EXIT_FAILURE);
+    }
+
+    struct stm_t stm;
+    stm_reset(&stm);
+
+    int server_fd = start_server();
+    printf("server started\n");
+
+    server_loop(server_fd, &stm);
 }
