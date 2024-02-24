@@ -50,3 +50,7 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+time-clang/compile_commands.json
+.vscode/settings.json
+time-clang/time-clang
