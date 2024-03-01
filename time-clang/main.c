@@ -14,7 +14,7 @@
 #include <liburing.h>
 
 #define PORT 12345
-#define QUEUE_SIZE 1
+#define QUEUE_SIZE 256
 #define BUFFER_SIZE 1024
 
 //===============================================
@@ -148,9 +148,11 @@ int server_start(void) {
     return server_fd;
 }
 
-void server_loop(struct io_uring *ring, int server_fd, struct stm_t *stm) {
+void server_loop(struct io_uring *ring, int server_fd, struct stm_t *stm_vec, unsigned stm_count) {
     // enqueue initial accept operation
-    stm_process(ring, server_fd, stm, 0);
+    struct stm_t *iter = stm_vec;
+    for (int i = 0; i < stm_count; ++i, ++iter)
+        stm_process(ring, server_fd, iter, 0);
 
     struct io_uring_cqe *cqe;
     while (true) {
@@ -165,7 +167,9 @@ void server_loop(struct io_uring *ring, int server_fd, struct stm_t *stm) {
             exit(EXIT_FAILURE);
         }
 
-        stm_process(ring, server_fd, stm, cqe->res);
+        //printf("%llu\n", cqe->user_data);
+
+        stm_process(ring, server_fd, (struct stm_t*)cqe->user_data, cqe->res);
 
         io_uring_cqe_seen(ring, cqe);
     }
@@ -191,11 +195,11 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
-    struct stm_t stm;
-    bzero(&stm, sizeof(struct stm_t));
+    struct stm_t stm[QUEUE_SIZE];
+    bzero(stm, QUEUE_SIZE * sizeof(struct stm_t));
 
     int server_fd = server_start();
     printf("server started\n");
 
-    server_loop(&ring, server_fd, &stm);
+    server_loop(&ring, server_fd, stm, QUEUE_SIZE);
 }
