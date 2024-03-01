@@ -21,10 +21,10 @@
 // io_uring
 //===============================================
 
-void io_uring_async_accept(struct io_uring *ring, int server_fd) {
+void io_uring_enqueue_accept(struct io_uring *ring, int server_fd, void *user_data) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     io_uring_prep_accept(sqe, server_fd, (struct sockaddr *)NULL, NULL, 0);
-    io_uring_sqe_set_data(sqe, NULL);
+    io_uring_sqe_set_data(sqe, user_data);
     
     if (io_uring_submit(ring) < 0) {
         perror("io_uring_submit failed");
@@ -32,7 +32,7 @@ void io_uring_async_accept(struct io_uring *ring, int server_fd) {
     }
 }
 
-void io_uring_async_read(struct io_uring *ring, int fd, struct iovec *io, void *user_data) {
+void io_uring_enqueue_read(struct io_uring *ring, int fd, struct iovec *io, void *user_data) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     io_uring_prep_readv(sqe, fd, io, 1, 0);
     io_uring_sqe_set_data(sqe, user_data);
@@ -43,7 +43,7 @@ void io_uring_async_read(struct io_uring *ring, int fd, struct iovec *io, void *
     }
 }
 
-void io_uring_async_write(struct io_uring *ring, int fd, struct iovec *io, void *user_data) {
+void io_uring_enqueue_write(struct io_uring *ring, int fd, struct iovec *io, void *user_data) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     io_uring_prep_writev(sqe, fd, io, 1, 0);
     io_uring_sqe_set_data(sqe, user_data);
@@ -58,9 +58,9 @@ void io_uring_async_write(struct io_uring *ring, int fd, struct iovec *io, void 
 // stm
 //===============================================
 
+#define STM_ACCEPT_CONNECTION 0
 #define STM_READ_HTTP_REQUEST 10
-#define STM_WRITE_HTTP_RESPONSE  20
-#define STM_CLOSE_CONNECTION  30
+#define STM_WRITE_HTTP_RESPONSE 20
 
 struct stm_t {
     int step;
@@ -69,42 +69,45 @@ struct stm_t {
     struct iovec io;
 };
 
-void stm_reset(struct stm_t *stm) {
-    bzero(stm, sizeof(struct stm_t));
-}
+// processing loop
+// 1: accept connection
+// 2: read http request
+// 3: write http response
+// 4: goto 1
 
-void stm_start(struct stm_t *stm, int conn_fd) {
-    stm->conn_fd = conn_fd;
-    stm->step = STM_READ_HTTP_REQUEST;
-}
-
-bool stm_process(struct io_uring *ring, struct stm_t *stm, int ring_result) {
+void stm_process(struct io_uring *ring, int server_fd, struct stm_t *stm, int ring_result) {
+    if (stm->step == STM_ACCEPT_CONNECTION) {
+        if (stm->conn_fd > 0) {
+            //printf("close connection\n");
+            if (close(stm->conn_fd) < 0) {
+                perror("close failed");
+                exit(EXIT_FAILURE);        
+            }
+        }
+        bzero(stm, sizeof(struct stm_t)); // reset stm
+        //printf("accept connection\n");
+        io_uring_enqueue_accept(ring, server_fd, stm);
+        stm->step = STM_READ_HTTP_REQUEST;
+        return;
+    }
     if (stm->step == STM_READ_HTTP_REQUEST) {
-        printf("read http request\n");
+        stm->conn_fd = ring_result;
+        //printf("read http request\n");
         stm->io.iov_base = stm->buf;
         stm->io.iov_len = sizeof(stm->buf);
-        io_uring_async_read(ring, stm->conn_fd, &stm->io, stm);
+        io_uring_enqueue_read(ring, stm->conn_fd, &stm->io, stm);
         stm->step = STM_WRITE_HTTP_RESPONSE;
-        return true; // busy
+        return;
     }
     if (stm->step == STM_WRITE_HTTP_RESPONSE) {
-        printf("%.*s\n", ring_result, stm->buf); // print request body
-        printf("write http response\n");
+        //printf("%.*s\n", ring_result, stm->buf); // print request body
+        //printf("write http response\n");
         time_t now = time(NULL);
         stm->io.iov_base = stm->buf;
         stm->io.iov_len = snprintf(stm->buf, sizeof(stm->buf), "HTTP/1.1 200 OK\r\n\r\n%.24s\r\n", ctime(&now));
-        io_uring_async_write(ring, stm->conn_fd, &stm->io, stm);
-        stm->step = STM_CLOSE_CONNECTION;
-        return true; // busy
-    }
-    if (stm->step == STM_CLOSE_CONNECTION) {
-        printf("close connection\n");
-        if (close(stm->conn_fd) < 0) {
-            perror("close failed");
-            exit(EXIT_FAILURE);        
-        }
-        stm_reset(stm);
-        return false; // done
+        io_uring_enqueue_write(ring, stm->conn_fd, &stm->io, stm);
+        stm->step = STM_ACCEPT_CONNECTION;
+        return;
     }
     printf("invalid stm step %d\n", stm->step);
     exit(EXIT_FAILURE);    
@@ -146,7 +149,8 @@ int server_start(void) {
 }
 
 void server_loop(struct io_uring *ring, int server_fd, struct stm_t *stm) {
-    io_uring_async_accept(ring, server_fd);
+    // enqueue initial accept operation
+    stm_process(ring, server_fd, stm, 0);
 
     struct io_uring_cqe *cqe;
     while (true) {
@@ -155,24 +159,13 @@ void server_loop(struct io_uring *ring, int server_fd, struct stm_t *stm) {
             exit(EXIT_FAILURE);
         }
 
-        printf("ring operation finished with result %d\n", cqe->res);
+        //printf("ring operation finished with result %d\n", cqe->res);
         if (cqe->res < 0) {
             perror("ring operation failed");
             exit(EXIT_FAILURE);
         }
 
-        printf("cqe->user_data = %llu\n", cqe->user_data);
-        if (cqe->user_data == 0) {
-            // new connection
-            printf("new connection\n");
-            stm_start(stm, cqe->res);
-        }
-
-        if (stm_process(ring, stm, cqe->res) == false) {
-            // flow complete, accept a new connection
-            printf("flow complete\n");
-            io_uring_async_accept(ring, server_fd);
-        }
+        stm_process(ring, server_fd, stm, cqe->res);
 
         io_uring_cqe_seen(ring, cqe);
     }
@@ -199,7 +192,7 @@ int main(void) {
     }
 
     struct stm_t stm;
-    stm_reset(&stm);
+    bzero(&stm, sizeof(struct stm_t));
 
     int server_fd = server_start();
     printf("server started\n");
