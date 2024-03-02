@@ -14,7 +14,8 @@
 #include <liburing.h>
 
 #define PORT 12345
-#define QUEUE_SIZE 128
+#define MAX_THREADS 2
+#define QUEUE_SIZE 1
 #define BUFFER_SIZE 1024
 
 //===============================================
@@ -193,12 +194,11 @@ void server_loop(struct io_uring *ring, int server_fd, struct stm_t *stm_vec, un
 struct io_uring ring;
 
 void sigint_handler(int signo) {
-    printf("server stopped\n");
     io_uring_queue_exit(&ring);
     exit(EXIT_SUCCESS);
 }
 
-int main(void) {
+void run(void) {
     signal(SIGINT, sigint_handler);
     
     if (io_uring_queue_init(QUEUE_SIZE, &ring, 0) < 0) {
@@ -210,7 +210,17 @@ int main(void) {
     bzero(stm, QUEUE_SIZE * sizeof(struct stm_t));
 
     int server_fd = server_start();
-    printf("server started\n");
 
     server_loop(&ring, server_fd, stm, QUEUE_SIZE);
+}
+
+int main(void) {
+    printf("server started\n");
+
+    // spawn worker threads
+    for (int i = 1; i < MAX_THREADS; ++i) {
+        if (fork() == 0)
+            break;
+    }
+    run();
 }

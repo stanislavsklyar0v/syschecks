@@ -86,27 +86,43 @@ int server_accept(int server_fd) {
 void server_handle_event(int epoll_fd, int server_fd, struct epoll_event *event) {
     if (event->data.fd == server_fd) {
         // new connection
+        //printf("new connection\n");
         int conn_fd = server_accept(server_fd);
         server_setnonblock(conn_fd);
-        epoll_add(epoll_fd, conn_fd, EPOLLIN|EPOLLET);
+        epoll_add(epoll_fd, conn_fd, EPOLLIN|EPOLLET|EPOLLHUP|EPOLLRDHUP);
     } 
     else if (event->events & EPOLLIN) {
         // handle request
+        //printf("handle request\n");
         char buf[BUFFER_SIZE];
+        // read incoming request
         if (read(event->data.fd, buf, sizeof(buf)) < 0) {
             perror("read failed");
             exit(EXIT_FAILURE);
         }
+        // write response
         time_t now = time(NULL);
         int n = snprintf(buf, sizeof(buf), "HTTP/1.1 200 OK\r\n\r\n%.24s\r\n", ctime(&now));
         if (write(event->data.fd, buf, n) < 0) {
             perror("write failed");
             exit(EXIT_FAILURE);
         }
+        // close connection and remove it from epoll queue
+        //printf("close connection\n");
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event->data.fd, NULL) < 0) {
+            perror("epoll_ctl failed");
+            exit(EXIT_FAILURE);
+        }
         if (close(event->data.fd) < 0) {
             perror("close failed");
             exit(EXIT_FAILURE);
         }
+    }
+    else if (event->events & (EPOLLHUP|EPOLLRDHUP)) {
+        // connection closed by another side
+        //printf("connection closed by another side\n");
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event->data.fd, NULL);
+        close(event->data.fd);
     }
     else {
         printf("unexpected");
