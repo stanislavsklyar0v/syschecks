@@ -51,6 +51,10 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
-time-clang/compile_commands.json
 .vscode/settings.json
-time-clang/time-clang
+time-clang-epoll/compile_commands.json
+time-clang-epoll/main
+time-clang-threads/compile_commands.json
+time-clang-threads/main
+time-clang-uring/compile_commands.json
+time-clang-uring/main

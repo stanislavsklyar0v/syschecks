@@ -14,7 +14,7 @@
 #include <liburing.h>
 
 #define PORT 12345
-#define QUEUE_SIZE 256
+#define QUEUE_SIZE 128
 #define BUFFER_SIZE 1024
 
 //===============================================
@@ -54,6 +54,17 @@ void io_uring_enqueue_write(struct io_uring *ring, int fd, struct iovec *io, voi
     }
 }
 
+void io_uring_enqueue_close(struct io_uring *ring, int fd, void *user_data) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_close(sqe, fd);
+    io_uring_sqe_set_data(sqe, user_data);
+    
+    if (io_uring_submit(ring) < 0) {
+        perror("io_uring_submit failed");
+        exit(EXIT_FAILURE);
+    }
+}
+
 //===============================================
 // stm
 //===============================================
@@ -61,6 +72,7 @@ void io_uring_enqueue_write(struct io_uring *ring, int fd, struct iovec *io, voi
 #define STM_ACCEPT_CONNECTION 0
 #define STM_READ_HTTP_REQUEST 10
 #define STM_WRITE_HTTP_RESPONSE 20
+#define STM_CLOSE_CONNECTION 30
 
 struct stm_t {
     int step;
@@ -73,17 +85,10 @@ struct stm_t {
 // 1: accept connection
 // 2: read http request
 // 3: write http response
-// 4: goto 1
+// 4: close connection
 
 void stm_process(struct io_uring *ring, int server_fd, struct stm_t *stm, int ring_result) {
     if (stm->step == STM_ACCEPT_CONNECTION) {
-        if (stm->conn_fd > 0) {
-            //printf("close connection\n");
-            if (close(stm->conn_fd) < 0) {
-                perror("close failed");
-                exit(EXIT_FAILURE);        
-            }
-        }
         bzero(stm, sizeof(struct stm_t)); // reset stm
         //printf("accept connection\n");
         io_uring_enqueue_accept(ring, server_fd, stm);
@@ -106,6 +111,12 @@ void stm_process(struct io_uring *ring, int server_fd, struct stm_t *stm, int ri
         stm->io.iov_base = stm->buf;
         stm->io.iov_len = snprintf(stm->buf, sizeof(stm->buf), "HTTP/1.1 200 OK\r\n\r\n%.24s\r\n", ctime(&now));
         io_uring_enqueue_write(ring, stm->conn_fd, &stm->io, stm);
+        stm->step = STM_CLOSE_CONNECTION;
+        return;
+    }
+    if (stm->step == STM_CLOSE_CONNECTION) {
+        //printf("close connection");
+        io_uring_enqueue_close(ring, stm->conn_fd, stm);
         stm->step = STM_ACCEPT_CONNECTION;
         return;
     }
